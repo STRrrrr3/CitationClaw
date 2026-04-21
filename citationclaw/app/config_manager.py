@@ -143,6 +143,9 @@ class AppConfig(BaseModel):
     # MinerU Cloud API
     mineru_api_token: str = Field(default="", description="MinerU Cloud Precision API Token（可选，用于大文件解析）")
 
+    # CDP (Chrome DevTools Protocol) 浏览器调试端口
+    cdp_debug_port: int = Field(default=0, description="CDP 调试浏览器远程端口（0=禁用，9222=常用端口），用于下载 IEEE/Elsevier 付费论文")
+
     # 费用追踪配置
     api_access_token: str = Field(default="", description="API中转站系统令牌（用于查询额度，在个人中心获取）")
     api_user_id: str = Field(default="", description="API中转站用户数字ID（在个人中心查看）")

@@ -1,18 +1,45 @@
 """S2-first metadata collector.
 
 Primary: Semantic Scholar (like PaperRadar — one query returns everything).
-Supplement: OpenAlex (h-index, OA PDF), arXiv (reliable PDF).
+Supplement: OpenAlex (h-index, OA PDF), Unpaywall (OA PDF by DOI), arXiv (reliable PDF).
 
 S2 gives: paperId, authors (with affiliations), DOI, ArXiv ID,
 openAccessPdf, venue, year, citation count — all in one call.
 """
 import asyncio
 import re
+from datetime import datetime
 from typing import Optional, List
 
 from citationclaw.core.openalex_client import OpenAlexClient
 from citationclaw.core.s2_client import S2Client
 from citationclaw.core.arxiv_client import ArxivClient
+from citationclaw.core.unpaywall_client import UnpaywallClient
+
+
+_ARXIV_ID_RE = re.compile(r'^(\d{4})\.(\d{4,5})(v\d+)?$')
+
+
+async def _async_none():
+    """Awaitable that resolves to None — placeholder for gather slots."""
+    return None
+
+
+def _is_valid_arxiv_id(arxiv_id: str) -> bool:
+    """Accept only YYMM.NNNNN[vN] where YYMM is past or current month."""
+    if not arxiv_id:
+        return False
+    m = _ARXIV_ID_RE.match(arxiv_id.strip())
+    if not m:
+        return False
+    year_prefix = m.group(1)
+    yy, mm = int(year_prefix[:2]), int(year_prefix[2:])
+    if not (1 <= mm <= 12):
+        return False
+    now = datetime.utcnow()
+    paper_ym = (2000 + yy) * 12 + (mm - 1)
+    today_ym = now.year * 12 + (now.month - 1)
+    return paper_ym <= today_ym
 
 
 class MetadataCollector:
@@ -20,6 +47,7 @@ class MetadataCollector:
         self.openalex = OpenAlexClient(email=email)
         self.s2 = S2Client(api_key=s2_api_key)
         self.arxiv = ArxivClient()
+        self.unpaywall = UnpaywallClient(email=email or "citationclaw@research.tool")
         self._has_s2_key = bool(s2_api_key)
 
     async def collect(self, title: str, paper_url: str = "") -> Optional[dict]:
@@ -46,13 +74,20 @@ class MetadataCollector:
                 pass
 
         if s2_result:
-            # S2 found — quick supplement from OpenAlex
-            oa_result = None
-            try:
-                oa_result = await self.openalex.search_work(title)
-            except Exception:
-                pass
-            return self._build_from_s2(s2_result, oa_supplement=oa_result)
+            # S2 found — supplement from OpenAlex + Unpaywall in parallel
+            s2_doi = s2_result.get("doi", "")
+            oa_task = self.openalex.search_work(title)
+            up_task = self.unpaywall.lookup(s2_doi) if s2_doi else _async_none()
+            oa_result, up_pdf = await asyncio.gather(
+                oa_task, up_task, return_exceptions=True
+            )
+            if isinstance(oa_result, Exception):
+                oa_result = None
+            if isinstance(up_pdf, Exception):
+                up_pdf = None
+            return self._build_from_s2(
+                s2_result, oa_supplement=oa_result, unpaywall_pdf_url=up_pdf
+            )
 
         # Step 3: S2 missed entirely — parallel fallback to OpenAlex + arXiv
         oa_result, arxiv_result = await asyncio.gather(
@@ -66,16 +101,34 @@ class MetadataCollector:
             arxiv_result = None
 
         if oa_result or arxiv_result:
-            return self._build_from_fallback(oa_result, arxiv_result)
+            # Unpaywall supplement if DOI known
+            up_pdf = None
+            doi = (oa_result or {}).get("doi", "") if oa_result else ""
+            if doi:
+                try:
+                    up_pdf = await self.unpaywall.lookup(doi)
+                except Exception:
+                    up_pdf = None
+            return self._build_from_fallback(oa_result, arxiv_result, unpaywall_pdf_url=up_pdf)
 
         return None
 
-    def _build_from_s2(self, s2: dict, oa_supplement: Optional[dict] = None) -> dict:
+    def _build_from_s2(
+        self,
+        s2: dict,
+        oa_supplement: Optional[dict] = None,
+        unpaywall_pdf_url: Optional[str] = None,
+    ) -> dict:
         """Build result with S2 as primary (PaperRadar-style)."""
         # S2 _parse_paper already extracts arxiv_id, doi, and builds pdf_url fallback chain
         arxiv_id = s2.get("arxiv_id", "")
         s2_doi = s2.get("doi", "")
         pdf_url = s2.get("pdf_url", "")
+
+        sources = ["s2"]
+        if arxiv_id and not _is_valid_arxiv_id(arxiv_id):
+            arxiv_id = ""
+            sources.append("arxiv_invalidated")
 
         result = {
             "title": s2.get("title", ""),
@@ -89,7 +142,7 @@ class MetadataCollector:
             "pdf_url": pdf_url,
             "oa_pdf_url": "",
             "authors": s2.get("authors", []),
-            "sources": ["s2"],
+            "sources": sources,
         }
 
         # Supplement from OpenAlex if available
@@ -107,9 +160,19 @@ class MetadataCollector:
             if oa_authors:
                 self._enrich_s2_authors(result["authors"], oa_authors)
 
+        # Unpaywall fills oa_pdf_url if OpenAlex didn't
+        if not result["oa_pdf_url"] and unpaywall_pdf_url:
+            result["oa_pdf_url"] = unpaywall_pdf_url
+            result["sources"].append("unpaywall")
+
         return result
 
-    def _build_from_fallback(self, oa: Optional[dict], arxiv: Optional[dict]) -> dict:
+    def _build_from_fallback(
+        self,
+        oa: Optional[dict],
+        arxiv: Optional[dict],
+        unpaywall_pdf_url: Optional[str] = None,
+    ) -> dict:
         """Build result from OpenAlex/arXiv when S2 missed."""
         primary = oa or arxiv
         result = {
@@ -134,7 +197,11 @@ class MetadataCollector:
 
         if arxiv:
             result["sources"].append("arxiv")
-            result["arxiv_id"] = arxiv.get("arxiv_id", "")
+            candidate = arxiv.get("arxiv_id", "")
+            if candidate and not _is_valid_arxiv_id(candidate):
+                result["sources"].append("arxiv_invalidated")
+                candidate = ""
+            result["arxiv_id"] = candidate
             if not result["authors"]:
                 result["authors"] = arxiv.get("authors", [])
         else:
@@ -148,11 +215,20 @@ class MetadataCollector:
             pdf_url = oa["pdf_url"]
         result["pdf_url"] = pdf_url
 
-        # Extract arxiv_id from pdf_url if not set
+        # Extract arxiv_id from pdf_url if not set — with validation
         if not result.get("arxiv_id") and pdf_url and "arxiv.org" in pdf_url:
             m = re.search(r'arxiv\.org/(?:abs|pdf)/(\d+\.\d+)', pdf_url)
             if m:
-                result["arxiv_id"] = m.group(1)
+                candidate = m.group(1)
+                if _is_valid_arxiv_id(candidate):
+                    result["arxiv_id"] = candidate
+                elif "arxiv_invalidated" not in result["sources"]:
+                    result["sources"].append("arxiv_invalidated")
+
+        # Unpaywall fills oa_pdf_url if still empty
+        if not result["oa_pdf_url"] and unpaywall_pdf_url:
+            result["oa_pdf_url"] = unpaywall_pdf_url
+            result["sources"].append("unpaywall")
 
         return result
 
@@ -200,3 +276,4 @@ class MetadataCollector:
         await self.openalex.close()
         await self.s2.close()
         await self.arxiv.close()
+        await self.unpaywall.close()

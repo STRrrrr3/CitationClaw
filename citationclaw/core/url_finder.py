@@ -2,12 +2,49 @@
 通过 ScraperAPI 在 Google Scholar 搜索论文，提取"被引用次数"链接
 """
 import asyncio
+import json
+import os
+import tempfile
 import time
 import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Optional, Callable, List
+
+from citationclaw.app.config_manager import DATA_DIR
+
+_URL_CACHE_FILE = DATA_DIR / "cache" / "url_finder_cache.json"
+
+
+def _normalize_title_key(title: str) -> str:
+    """Lowercase + collapse whitespace for stable cache keys across runs."""
+    return " ".join((title or "").lower().split())
+
+
+def _load_url_cache() -> dict:
+    if _URL_CACHE_FILE.exists():
+        try:
+            return json.loads(_URL_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_url_cache(data: dict) -> None:
+    _URL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(_URL_CACHE_FILE.parent), suffix='.tmp')
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(_URL_CACHE_FILE))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
 
 
 class PaperURLFinder:
@@ -42,7 +79,7 @@ class PaperURLFinder:
             try:
                 api_key = self._next_key()
                 api_url = (
-                    f"http://api.scraperapi.com/"
+                    f"https://api.scraperapi.com/"
                     f"?api_key={api_key}&url={urllib.parse.quote(url, safe='')}"
                 )
                 resp = await asyncio.to_thread(requests.get, api_url, timeout=60)
@@ -67,7 +104,7 @@ class PaperURLFinder:
             try:
                 api_key = self._next_key()
                 api_url = (
-                    f"http://api.scraperapi.com/"
+                    f"https://api.scraperapi.com/"
                     f"?api_key={api_key}&url={urllib.parse.quote(url, safe='')}"
                 )
                 resp = requests.get(api_url, timeout=60)
@@ -105,7 +142,18 @@ class PaperURLFinder:
         After finding a cites= link, verifies that the result's title
         fuzzy-matches the input paper_title to avoid returning citations
         for a wrong paper.
+
+        Persistent cache at data/cache/url_finder_cache.json avoids re-hitting
+        Scholar for titles we have already resolved (and survives ScraperAPI
+        403s on subsequent runs).
         """
+        # -- 持久化标题→URL 缓存命中：直接返回，跳过 Scholar --
+        key = _normalize_title_key(paper_title)
+        cache = _load_url_cache()
+        if key in cache and cache[key]:
+            self.log(f"[URL查找] 缓存命中，跳过 Scholar: {cache[key]}")
+            return cache[key]
+
         search_url = (
             f"{self.SCHOLAR_BASE}/scholar"
             f"?q={urllib.parse.quote(paper_title)}&hl=en"
@@ -152,6 +200,7 @@ class PaperURLFinder:
                     continue
 
                 self.log(f"[URL查找] 找到引用链接: {full_url}")
+                self._persist_mapping(paper_title, full_url)
                 return full_url
 
         # Fallback: scan all links (for non-standard page layouts)
@@ -166,7 +215,20 @@ class PaperURLFinder:
                     continue
                 if "scholar.google" in full_url or href.startswith("/"):
                     self.log(f"[URL查找] 找到引用链接(fallback): {full_url}")
+                    self._persist_mapping(paper_title, full_url)
                     return full_url
 
         self.log(f"[URL查找] 未找到引用链接（论文可能没有引用记录）")
         return None
+
+    @staticmethod
+    def _persist_mapping(paper_title: str, full_url: str) -> None:
+        """Persist paper_title → cites URL mapping so future runs skip Scholar."""
+        try:
+            cache = _load_url_cache()
+            key = _normalize_title_key(paper_title)
+            if cache.get(key) != full_url:
+                cache[key] = full_url
+                _save_url_cache(cache)
+        except Exception:
+            pass  # cache failure must not break the main flow

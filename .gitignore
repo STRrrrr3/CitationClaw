@@ -16,6 +16,10 @@ build/
 .venv/
 venv/
 env/
+test_data/
+runtime/
+data/
+test/
 
 # MinerU local models (symlinked, ~2GB)
 data/models/
@@ -40,3 +44,6 @@ docs/
 
 # Office temp files
 ~$*
+
+# Claude Code local
+.claude/

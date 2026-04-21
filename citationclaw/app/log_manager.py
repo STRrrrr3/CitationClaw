@@ -8,7 +8,7 @@ from fastapi import WebSocket
 class LogManager:
     def __init__(self, max_logs: int = 1000):
         """
-        日志管理器,负责日志记录和WebSocket广播
+        日志管理器，负责日志记录和 WebSocket 广播
 
         Args:
             max_logs: 最大保留日志条数
@@ -18,16 +18,16 @@ class LogManager:
         self.current_progress = {"current": 0, "total": 100, "percentage": 0}
 
     def add_websocket(self, websocket: WebSocket):
-        """添加WebSocket连接"""
+        """添加 WebSocket 连接"""
         self.websocket_connections.add(websocket)
 
     def remove_websocket(self, websocket: WebSocket):
-        """移除WebSocket连接"""
+        """移除 WebSocket 连接"""
         self.websocket_connections.discard(websocket)
 
     async def _broadcast(self, message: dict):
         """
-        广播消息到所有连接的WebSocket
+        广播消息到所有连接的 WebSocket
 
         Args:
             message: 要广播的消息
@@ -37,23 +37,18 @@ class LogManager:
             try:
                 await ws.send_json(message)
             except Exception as e:
-                print(f"WebSocket发送失败: {e}")
+                print(f"WebSocket 发送失败: {e}")
                 disconnected.add(ws)
 
-        # 清理断开的连接
         self.websocket_connections -= disconnected
 
     def _schedule_broadcast(self, message: dict):
-        """
-        Schedule an async broadcast. Falls back to just appending to the deque
-        when no event loop is running (e.g. during startup or from a sync context).
-        """
+        """Schedule an async broadcast only when a running loop exists."""
         try:
-            asyncio.create_task(self._broadcast(message))
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running event loop — silently skip broadcast.
-            # The log entry is already in self.logs so it won't be lost.
-            pass
+            return
+        loop.create_task(self._broadcast(message))
 
     def _log(self, level: str, message: str):
         """
@@ -70,33 +65,31 @@ class LogManager:
         }
         self.logs.append(log_entry)
 
-        # 打印到控制台
         print(f"[{log_entry['timestamp']}] [{level}] {message}")
 
-        # 异步广播(不阻塞)
         self._schedule_broadcast({
             "type": "log",
             "data": log_entry
         })
 
     def info(self, message: str):
-        """记录INFO级别日志"""
+        """记录 INFO 级别日志"""
         self._log("INFO", message)
 
     def success(self, message: str):
-        """记录SUCCESS级别日志"""
+        """记录 SUCCESS 级别日志"""
         self._log("SUCCESS", message)
 
     def warning(self, message: str):
-        """记录WARNING级别日志"""
+        """记录 WARNING 级别日志"""
         self._log("WARNING", message)
 
     def error(self, message: str):
-        """记录ERROR级别日志"""
+        """记录 ERROR 级别日志"""
         self._log("ERROR", message)
 
     def broadcast_event(self, event_type: str, payload: dict):
-        """向所有 WebSocket 连接广播自定义事件（非日志型消息）"""
+        """向所有 WebSocket 连接广播自定义事件。"""
         self._schedule_broadcast({
             "type": event_type,
             "data": payload
@@ -117,7 +110,6 @@ class LogManager:
             "percentage": percentage
         }
 
-        # 异步广播进度
         self._schedule_broadcast({
             "type": "progress",
             "data": self.current_progress

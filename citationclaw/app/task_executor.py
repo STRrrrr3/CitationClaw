@@ -394,6 +394,7 @@ class TaskExecutor:
             llm_api_key=config.openai_api_key,
             llm_base_url=config.openai_base_url,
             llm_model=getattr(config, 'dashboard_model', '') or config.openai_model,
+            cdp_debug_port=getattr(config, 'cdp_debug_port', 0),
         )
         parser = MinerUParser(
             log_callback=self.log_manager.info,
@@ -434,20 +435,24 @@ class TaskExecutor:
             f"(跳过 {self_cite_count} 篇自引) (10 workers)..."
         )
 
-        # Set self-citation papers to None (skip download)
-        async def _dl_if_needed(idx, paper):
-            if self_cite_map.get(idx, False):
-                return None  # Skip self-citation
-            return await downloader.download(paper, log=self.log_manager.info)
+        pdf_paths: List[Optional[Path]] = [None] * len(dl_papers)
+        download_indices = [i for i in range(len(dl_papers)) if not self_cite_map.get(i, False)]
+        download_batch = [dl_papers[i] for i in download_indices]
 
-        sem = asyncio.Semaphore(10)
-        async def _dl_with_sem(idx, paper):
-            async with sem:
-                return await _dl_if_needed(idx, paper)
-
-        pdf_paths = await asyncio.gather(*[
-            _dl_with_sem(i, p) for i, p in enumerate(dl_papers)
-        ])
+        if download_batch:
+            batch_paths = await downloader.batch_download(
+                download_batch,
+                concurrency=10,
+                log=self.log_manager.info,
+            )
+            for idx, pdf_path in zip(download_indices, batch_paths):
+                pdf_paths[idx] = pdf_path
+                src = dl_papers[idx].get("_pdf_source", "")
+                if src:
+                    records_data[idx][0]["_pdf_source"] = src
+                failures = dl_papers[idx].get("_pdf_failures")
+                if failures:
+                    records_data[idx][0]["_pdf_failures"] = failures
 
         downloaded = sum(1 for i, p in enumerate(pdf_paths) if p and not self_cite_map.get(i, False))
         failed = need_download - downloaded
@@ -455,6 +460,7 @@ class TaskExecutor:
             f"PDF 下载: {downloaded}/{need_download} 篇成功"
             f"（{failed} 篇失败, {self_cite_count} 篇自引已跳过）"
         )
+
 
         # Parse + extract authors + cross-validate (parallel, 10 workers for Cloud API)
         if downloaded > 0:
